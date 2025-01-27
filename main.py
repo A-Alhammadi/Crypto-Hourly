@@ -219,7 +219,18 @@ def analyze_strategy_correlations(results_dict, df, symbol, output_dir):
 
 def plot_results(results_dict, symbol, output_dir):
     plt.style.use('default')
-    sns.set_palette("husl")
+    
+    # Create custom color map for strategies
+    strategy_colors = {
+        'Buy and Hold': 'black',
+        'Adaptive': 'yellow',
+        'EMA': 'blue',
+        'MACD': 'green',
+        'RSI': 'red',
+        'Stochastic': 'purple',
+        'Volume RSI': 'cyan',
+        'VWAP': 'magenta'
+    }
     
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
     
@@ -227,18 +238,20 @@ def plot_results(results_dict, symbol, output_dir):
     first_result = next(iter(results_dict.values()))
     df = first_result['portfolio']
     initial_capital = float(BACKTEST_CONFIG['initial_capital'])
-    initial_price = float(df['close'].iloc[0])  # Changed from close_price to close
+    initial_price = float(df['close'].iloc[0])
     buy_hold_units = initial_capital / initial_price
-    buy_hold_values = df['close'] * buy_hold_units  # Changed from close_price to close
+    buy_hold_values = df['close'] * buy_hold_units
     
     # Plot portfolio values
     ax1.plot(df.index, buy_hold_values, 
-             label='Buy and Hold', linewidth=2, color='black', linestyle='--')
+             label='Buy and Hold', linewidth=2, color=strategy_colors['Buy and Hold'], 
+             linestyle='--')
     
     for strategy_name, result in results_dict.items():
         portfolio = result['portfolio']
+        color = strategy_colors.get(strategy_name, 'gray')  # Default to gray if strategy not in color map
         ax1.plot(portfolio.index, portfolio['total_value'], 
-                label=strategy_name, linewidth=1.5)
+                label=strategy_name, linewidth=1.5, color=color)
     
     ax1.set_title(f'Portfolio Value Over Time - {symbol}', fontsize=12, pad=20)
     ax1.set_xlabel('Date', fontsize=10)
@@ -249,12 +262,14 @@ def plot_results(results_dict, symbol, output_dir):
     # Plot drawdowns
     buy_hold_dd = (buy_hold_values.cummax() - buy_hold_values) / buy_hold_values.cummax()
     ax2.plot(df.index, buy_hold_dd, 
-             label='Buy and Hold', linewidth=2, color='black', linestyle='--')
+             label='Buy and Hold', linewidth=2, color=strategy_colors['Buy and Hold'], 
+             linestyle='--')
     
     for strategy_name, result in results_dict.items():
         portfolio = result['portfolio']
         drawdown = (portfolio['total_value'].cummax() - portfolio['total_value']) / portfolio['total_value'].cummax()
-        ax2.plot(portfolio.index, drawdown, label=strategy_name, linewidth=1.5)
+        color = strategy_colors.get(strategy_name, 'gray')  # Default to gray if strategy not in color map
+        ax2.plot(portfolio.index, drawdown, label=strategy_name, linewidth=1.5, color=color)
     
     ax2.set_title('Strategy Drawdowns', fontsize=12, pad=20)
     ax2.set_xlabel('Date', fontsize=10)
