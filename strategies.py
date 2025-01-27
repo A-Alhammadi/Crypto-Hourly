@@ -102,7 +102,7 @@ class TradingStrategies:
     @staticmethod
     def adaptive_strategy(df):
         """
-        Enhanced adaptive strategy with performance-based selection and risk management.
+        Enhanced adaptive strategy with dynamic strategy selection and machine learning inspired features.
         """
         signals = pd.Series(index=df.index, data=0)
         
@@ -116,124 +116,165 @@ class TradingStrategies:
             'vwap': TradingStrategies.vwap_strategy(df)
         }
         
-        # Calculate market regime indicators
-        # Volatility using ATR
-        high_low = df['high_price'] - df['low_price']
-        high_close = abs(df['high_price'] - df['close_price'].shift())
-        low_close = abs(df['low_price'] - df['close_price'].shift())
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        atr = tr.rolling(window=14).mean()
-        volatility = atr / df['close_price']
+        # Calculate market indicators
+        price = df['close_price']
+        returns = price.pct_change()
         
-        # Pre-calculate volatility regimes for the entire series
-        vol_quantiles = volatility.quantile([0.33, 0.66])
-        vol_regimes = pd.Series(index=volatility.index, data='medium')
-        vol_regimes[volatility <= vol_quantiles[0.33]] = 'low'
-        vol_regimes[volatility > vol_quantiles[0.66]] = 'high'
+        # Multiple volatility measures
+        returns_vol = returns.rolling(window=20).std().fillna(0)
+        high_low_vol = ((df['high_price'] - df['low_price']) / df['close_price']).rolling(window=20).mean().fillna(0)
         
-        # Enhanced trend strength indicators
-        short_trend = df['ema_9'] / df['ema_21'] - 1
-        medium_trend = df['ema_21'] / df['ema_50'] - 1
-        trend_strength = (abs(short_trend) + abs(medium_trend)) / 2
-        trend_direction = np.sign(short_trend + medium_trend)
+        # Trend indicators
+        ema_short = df['ema_9']
+        ema_med = df['ema_21']
+        ema_long = df['ema_50']
         
-        # Volume and momentum indicators
-        relative_volume = df['volume_crypto'] / df['volume_crypto'].rolling(window=20).mean()
-        momentum = df['close_price'].pct_change(5)
+        trend_strength = abs((ema_short - ema_long) / ema_long).fillna(0)
+        trend_direction = np.sign(ema_short - ema_long)
         
-        # Calculate recent performance of each strategy
-        lookback = 20  # Days to look back for performance evaluation
-        strategy_performance = {}
+        # Volume analysis
+        volume = df['volume_crypto']
+        volume_ma = volume.rolling(window=20).mean()
+        relative_volume = (volume / volume_ma).fillna(1)
+        
+        # Dynamic lookback period based on volatility
+        base_lookback = 20
+        vol_ratio = returns_vol / returns_vol.rolling(100).mean()
+        vol_ratio = vol_ratio.fillna(1).replace([np.inf, -np.inf], 1)
+        vol_adjusted_lookback = (base_lookback * (1 + vol_ratio)).clip(10, 30).astype(int)
+        
+        # Calculate strategy performance metrics
+        strategy_metrics = {}
         
         for name, strat_signals in strategy_signals.items():
-            # Calculate returns if we followed each strategy
-            returns = df['close_price'].pct_change() * strat_signals.shift()
-            # Calculate rolling Sharpe ratio for each strategy
-            rolling_sharpe = (returns.rolling(lookback).mean() / returns.rolling(lookback).std()) * np.sqrt(252)
-            strategy_performance[name] = rolling_sharpe
+            # Calculate strategy returns
+            strat_returns = returns * strat_signals.shift()
+            
+            # Calculate dynamic performance metrics
+            rolling_sharpe = pd.Series(index=df.index, data=np.nan)
+            rolling_sortino = pd.Series(index=df.index, data=np.nan)
+            win_rate = pd.Series(index=df.index, data=np.nan)
+            
+            for i in range(base_lookback, len(df)):
+                lookback = vol_adjusted_lookback.iloc[i]
+                period_returns = strat_returns.iloc[i-lookback:i]
+                
+                # Sharpe Ratio with safety checks
+                returns_std = period_returns.std()
+                if returns_std != 0 and not np.isnan(returns_std):
+                    sharpe = (period_returns.mean() / returns_std) * np.sqrt(252)
+                else:
+                    sharpe = 0
+                rolling_sharpe.iloc[i] = sharpe
+                
+                # Sortino Ratio with safety checks
+                downside_returns = period_returns[period_returns < 0]
+                downside_std = downside_returns.std()
+                if len(downside_returns) > 0 and downside_std != 0 and not np.isnan(downside_std):
+                    sortino = (period_returns.mean() / downside_std) * np.sqrt(252)
+                else:
+                    sortino = 0
+                rolling_sortino.iloc[i] = sortino
+                
+                # Win Rate
+                win_rate.iloc[i] = (period_returns > 0).mean()
+            
+            strategy_metrics[name] = {
+                'sharpe': rolling_sharpe.fillna(0),
+                'sortino': rolling_sortino.fillna(0),
+                'win_rate': win_rate.fillna(0)
+            }
         
-        # Convert to DataFrame for easier manipulation
-        performance_df = pd.DataFrame(strategy_performance)
-        
-        # Function to get optimal strategy based on market conditions and recent performance
-        def get_optimal_strategy(i, vol_regime, trend_str, trend_dir, rel_vol, mom, perf_df):
-            # Get top 2 performing strategies
-            if i >= lookback:
-                recent_performance = perf_df.iloc[i]
-                top_strategies = recent_performance.nlargest(2).index.tolist()
+        # Function to get strategy weights based on market conditions and performance
+        def get_strategy_weights(i, metrics, vol, trend_str, trend_dir, rel_vol):
+            if i < base_lookback:
+                return {'ema': 1.0}  # Default to EMA for initial period
+            
+            weights = {}
+            total_score = 0
+            
+            for strategy in strategy_metrics.keys():
+                # Base score from performance metrics
+                perf_score = (
+                    metrics[strategy]['sharpe'].iloc[i] * 0.4 +
+                    metrics[strategy]['sortino'].iloc[i] * 0.4 +
+                    metrics[strategy]['win_rate'].iloc[i] * 0.2
+                )
+                
+                # Adjust score based on market conditions
+                vol_percentile = vol.rank(pct=True).iloc[i]
+                trend_percentile = trend_str.rank(pct=True).iloc[i]
+                volume_percentile = rel_vol.rank(pct=True).iloc[i]
+                
+                if vol_percentile > 0.8:  # High volatility
+                    if strategy in ['rsi', 'vwap']:
+                        perf_score *= 1.3
+                elif vol_percentile < 0.2:  # Low volatility
+                    if strategy in ['ema', 'macd']:
+                        perf_score *= 1.2
+                
+                if trend_percentile > 0.7:  # Strong trend
+                    if strategy in ['macd', 'ema']:
+                        perf_score *= 1.25
+                
+                if volume_percentile > 0.75:  # High volume
+                    if strategy in ['volume_rsi', 'vwap']:
+                        perf_score *= 1.2
+                
+                weights[strategy] = max(0, perf_score)  # Ensure non-negative weights
+                total_score += weights[strategy]
+            
+            # Normalize weights
+            if total_score > 0:
+                weights = {k: v/total_score for k, v in weights.items()}
             else:
-                top_strategies = ['ema', 'macd']  # Default for initial period
+                # Default to equal weights if no strategy has positive score
+                weights = {k: 1/len(weights) for k in weights}
             
-            # Strategy selection logic based on market conditions and performance
-            if vol_regime == 'high':
-                if trend_dir > 0:
-                    primary = 'macd' if 'macd' in top_strategies else top_strategies[0]
-                    secondary = 'rsi'
-                else:
-                    primary = 'rsi' if 'rsi' in top_strategies else top_strategies[0]
-                    secondary = 'vwap'
-            elif vol_regime == 'low':
-                if trend_dir > 0:
-                    primary = 'ema' if 'ema' in top_strategies else top_strategies[0]
-                    secondary = 'macd'
-                else:
-                    primary = 'vwap' if 'vwap' in top_strategies else top_strategies[0]
-                    secondary = 'volume_rsi'
-            else:  # medium volatility
-                if trend_str > trend_strength.quantile(0.7):  # Strong trend
-                    primary = top_strategies[0]
-                    secondary = 'macd'
-                else:  # Weak trend
-                    primary = 'rsi' if 'rsi' in top_strategies else top_strategies[0]
-                    secondary = 'vwap'
-            
-            return primary, secondary
+            return weights
         
         # Generate adaptive signals
         for i in range(len(df)):
-            # Get optimal strategies for current conditions
-            primary_strat, secondary_strat = get_optimal_strategy(
-                i, vol_regimes.iloc[i], trend_strength.iloc[i], trend_direction.iloc[i],
-                relative_volume.iloc[i], momentum.iloc[i], performance_df
+            # Get strategy weights
+            weights = get_strategy_weights(
+                i, strategy_metrics,
+                returns_vol,
+                trend_strength,
+                trend_direction,
+                relative_volume
             )
             
-            # Weight between primary and secondary strategies based on confidence
-            if i >= lookback:
-                primary_weight = 0.7  # Higher weight to primary strategy
-                secondary_weight = 0.3
-                
-                # Combine signals with weights
-                combined_signal = (
-                    strategy_signals[primary_strat].iloc[i] * primary_weight +
-                    strategy_signals[secondary_strat].iloc[i] * secondary_weight
-                )
-                
-                # Apply thresholds for final signal
-                if combined_signal > 0.5:
-                    signals.iloc[i] = 1
-                elif combined_signal < -0.5:
-                    signals.iloc[i] = -1
-                else:
-                    signals.iloc[i] = 0
+            # Combine signals using weights
+            combined_signal = 0
+            for strategy, weight in weights.items():
+                combined_signal += strategy_signals[strategy].iloc[i] * weight
+            
+            # Apply thresholds for final signal
+            if combined_signal > 0.3:
+                signals.iloc[i] = 1
+            elif combined_signal < -0.3:
+                signals.iloc[i] = -1
             else:
-                # Use EMA strategy for initial period
-                signals.iloc[i] = strategy_signals['ema'].iloc[i]
+                signals.iloc[i] = 0
         
-        # Apply risk management rules
+        # Apply enhanced risk management
         
-        # 1. No trading during extreme volatility
-        extreme_vol = volatility > volatility.quantile(0.95)
-        signals[extreme_vol] = 0
+        # 1. Volatility-based position sizing
+        vol_percentile = returns_vol.rank(pct=True)
+        high_vol_mask = vol_percentile > 0.85
+        signals[high_vol_mask] = signals[high_vol_mask] * 0.5  # Reduce position size
         
-        # 2. Trend confirmation
-        # Only take long positions in uptrends and short positions in downtrends
-        signals[(trend_direction < 0) & (signals == 1)] = 0
-        signals[(trend_direction > 0) & (signals == -1)] = 0
+        # 2. Trend alignment
+        trend_mask = (trend_direction * signals) < 0  # Signals against trend
+        signals[trend_mask] = 0  # Cancel signals against major trend
         
         # 3. Volume confirmation
-        # Don't trade on very low volume
-        low_vol = relative_volume < relative_volume.quantile(0.2)
-        signals[low_vol] = 0
+        low_vol_mask = relative_volume < relative_volume.quantile(0.2)
+        signals[low_vol_mask] = 0  # No trading on very low volume
+        
+        # 4. Extreme volatility protection
+        extreme_vol_mask = returns_vol > returns_vol.quantile(0.95)
+        signals[extreme_vol_mask] = 0  # No trading during extreme volatility
         
         return signals
     @classmethod
