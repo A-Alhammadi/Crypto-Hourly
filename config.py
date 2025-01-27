@@ -10,7 +10,7 @@ DB_CONFIG = {
 # Backtesting configuration
 BACKTEST_CONFIG = {
     # Date range
-    "start_date": "2024-01-01",
+    "start_date": "2020-01-01",
     "end_date": "2024-12-31",
     
     # Trading pairs to test
