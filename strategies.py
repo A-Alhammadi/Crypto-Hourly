@@ -1,3 +1,5 @@
+#strategies.py
+
 import pandas as pd
 import numpy as np
 from config import BACKTEST_CONFIG
@@ -102,11 +104,43 @@ class TradingStrategies:
     @staticmethod
     def adaptive_strategy(df):
         """
-        Enhanced adaptive strategy optimized for performance while maintaining exact same logic.
+        Improved Adaptive Strategy for Hourly Crypto Data
+
+        Key Changes:
+        1. Evaluates each base strategy (EMA, MACD, RSI, Stoch, Volume RSI, VWAP) on
+        both a short-term and medium-term rolling window.
+        - Short-term performance: captures current alignment with immediate market moves.
+        - Medium-term performance: avoids chasing noise and adds stability.
+
+        2. Combines Sharpe, Sortino, and Win Rate into a performance score, but the weighting
+        for short vs. medium term can be adjusted for best results.
+
+        3. Eliminates large fixed multipliers for volatility/trend conditions; instead uses
+        a more systematic approach to slightly reward or penalize a strategy's score
+        if it historically performs well/poorly in the current environment. This should
+        make it more robust for different coins/tokens.
+
+        4. Risk management is more gradual:
+        - High volatility or extremely low volume reduces position size
+            rather than forcing signals fully to zero.
+        - Trend mismatch still zeros out signals to avoid bucking a strong long-term trend.
+
+        5. Uses sqrt(8760) in Sharpe/Sortino to reflect hourly bars (24 hours * 365 days = 8760).
         """
+
+        import numpy as np
+        import pandas as pd
+
+        # Annualization factor for hourly data (24h * 365 = 8760)
+        ANNUAL_FACTOR = np.sqrt(8760)
+
+        # -------------------------------------------------------------------------
+        # 1) Gather all individual strategy signals
+        # -------------------------------------------------------------------------
         signals = pd.Series(index=df.index, data=0.0)
-        
-        # Get signals from all base strategies
+
+        # NOTE: We assume TradingStrategies is the same class that has .ema_strategy, etc.
+        # If you're inside the same file, you don't need to import it at all.
         strategy_signals = {
             'ema': TradingStrategies.ema_strategy(df),
             'macd': TradingStrategies.macd_strategy(df),
@@ -115,156 +149,197 @@ class TradingStrategies:
             'volume_rsi': TradingStrategies.volume_rsi_strategy(df),
             'vwap': TradingStrategies.vwap_strategy(df)
         }
-        
-        # Pre-calculate market indicators vectorially
+
+        # -------------------------------------------------------------------------
+        # 2) Calculate basic price returns for performance metrics
+        #    We'll use the close_price column to derive percentage returns.
+        # -------------------------------------------------------------------------
         price = df['close_price']
-        returns = price.pct_change()
-        returns_vol = returns.rolling(window=20).std().fillna(0)
-        high_low_vol = ((df['high_price'] - df['low_price']) / df['close_price']).rolling(window=20).mean().fillna(0)
-        
-        # Trend indicators
-        ema_short = df['ema_9']
-        ema_med = df['ema_21']
-        ema_long = df['ema_50']
-        
-        trend_strength = abs((ema_short - ema_long) / ema_long).fillna(0)
-        trend_direction = np.sign(ema_short - ema_long)
-        
-        # Volume analysis - vectorized
-        volume = df['volume_crypto']
-        volume_ma = volume.rolling(window=20).mean()
-        relative_volume = (volume / volume_ma).fillna(1)
-        
-        # Dynamic lookback calculation - vectorized
-        base_lookback = 20
-        vol_ratio = returns_vol / returns_vol.rolling(100).mean()
-        vol_ratio = vol_ratio.fillna(1).replace([np.inf, -np.inf], 1)
-        vol_adjusted_lookback = (base_lookback * (1 + vol_ratio)).clip(10, 30).astype(int)
-        
-        # Pre-calculate performance metrics for all strategies at once
+        returns = price.pct_change().fillna(0)
+
+        # -------------------------------------------------------------------------
+        # 3) Calculate rolling Sharpe, Sortino, Win Rate for each strategy
+        #    on both a short-term window and a medium-term window.
+        #    Example windows: short=15 bars, medium=60 bars.
+        #    Adjust if you want more smoothing or different lookbacks.
+        # -------------------------------------------------------------------------
+        short_window = 15
+        medium_window = 60
+
         strategy_metrics = {}
-        
-        for name, strat_signals in strategy_signals.items():
-            # Calculate strategy returns
-            strat_returns = returns * strat_signals.shift()
-            
-            # Initialize metric arrays
-            rolling_sharpe = np.full(len(df), np.nan)
-            rolling_sortino = np.full(len(df), np.nan)
-            win_rate = np.full(len(df), np.nan)
-            
-            # Vectorized calculation for rolling windows
-            for i in range(base_lookback, len(df)):
-                lookback = vol_adjusted_lookback.iloc[i]
-                period_returns = strat_returns.iloc[i-lookback:i]
-                
-                # Sharpe Ratio with safety checks
-                returns_std = period_returns.std()
-                if returns_std != 0 and not np.isnan(returns_std):
-                    rolling_sharpe[i] = (period_returns.mean() / returns_std) * np.sqrt(252)
-                else:
-                    rolling_sharpe[i] = 0
-                
-                # Sortino Ratio with safety checks
-                downside_returns = period_returns[period_returns < 0]
-                downside_std = downside_returns.std()
-                if len(downside_returns) > 0 and downside_std != 0 and not np.isnan(downside_std):
-                    rolling_sortino[i] = (period_returns.mean() / downside_std) * np.sqrt(252)
-                else:
-                    rolling_sortino[i] = 0
-                
-                # Win Rate
-                win_rate[i] = (period_returns > 0).mean()
-            
+        for name, strat_signal_series in strategy_signals.items():
+            # Strategy returns = price returns * previous bar's signal
+            strat_returns = returns * strat_signal_series.shift(1).fillna(0)
+
+            # Rolling Sharpe (short window)
+            rolling_sharpe_short = strat_returns.rolling(short_window).apply(
+                lambda x: (x.mean() / x.std()) * ANNUAL_FACTOR if x.std() != 0 else 0,
+                raw=False
+            ).fillna(0)
+
+            # Rolling Sharpe (medium window)
+            rolling_sharpe_med = strat_returns.rolling(medium_window).apply(
+                lambda x: (x.mean() / x.std()) * ANNUAL_FACTOR if x.std() != 0 else 0,
+                raw=False
+            ).fillna(0)
+
+            # Sortino ratio function (penalizes only negative volatility)
+            def sortino(x):
+                neg = x[x < 0]
+                if len(neg) == 0 or neg.std() == 0:
+                    return 0
+                return (x.mean() / neg.std()) * ANNUAL_FACTOR
+
+            # Rolling Sortino (short window)
+            rolling_sortino_short = strat_returns.rolling(short_window).apply(
+                sortino, raw=False
+            ).fillna(0)
+
+            # Rolling Sortino (medium window)
+            rolling_sortino_med = strat_returns.rolling(medium_window).apply(
+                sortino, raw=False
+            ).fillna(0)
+
+            # Rolling Win Rate (short vs medium)
+            rolling_winrate_short = strat_returns.rolling(short_window).apply(
+                lambda x: (x > 0).mean(), raw=False
+            ).fillna(0)
+            rolling_winrate_med = strat_returns.rolling(medium_window).apply(
+                lambda x: (x > 0).mean(), raw=False
+            ).fillna(0)
+
+            # Store the rolling metrics
             strategy_metrics[name] = {
-                'sharpe': pd.Series(rolling_sharpe, index=df.index).fillna(0),
-                'sortino': pd.Series(rolling_sortino, index=df.index).fillna(0),
-                'win_rate': pd.Series(win_rate, index=df.index).fillna(0)
+                'sharpe_short': rolling_sharpe_short,
+                'sharpe_med': rolling_sharpe_med,
+                'sortino_short': rolling_sortino_short,
+                'sortino_med': rolling_sortino_med,
+                'winrate_short': rolling_winrate_short,
+                'winrate_med': rolling_winrate_med
             }
-        
-        # Pre-calculate percentile ranks for market conditions
-        vol_rank = returns_vol.rank(pct=True)
-        trend_rank = trend_strength.rank(pct=True)
-        volume_rank = relative_volume.rank(pct=True)
-        
-        # Function to get strategy weights (kept the same for consistency)
-        def get_strategy_weights(i, metrics, vol_pct, trend_pct, trend_dir, vol_pct_rank):
-            if i < base_lookback:
-                return {'ema': 1.0}
-            
-            weights = {}
-            total_score = 0
-            
-            for strategy in strategy_metrics.keys():
-                # Base score from performance metrics
+
+        # -------------------------------------------------------------------------
+        # 4) Evaluate the market regime (volatility, volume, trend) for partial
+        #    scoring adjustments. Subtle to avoid overfitting.
+        # -------------------------------------------------------------------------
+        # Volatility (20-bar std dev of returns)
+        vol = returns.rolling(20).std().fillna(0)
+
+        # Trend measure: difference between short & long EMA
+        trend_direction = np.sign(df['ema_9'] - df['ema_50']).fillna(0)
+        trend_strength = (df['ema_9'] - df['ema_50']).abs() / df['ema_50'].replace(0, np.nan)
+        trend_strength = trend_strength.fillna(0)
+
+        # Relative volume (vs 20-bar average)
+        volume_ma = df['volume_crypto'].rolling(20).mean().fillna(method='bfill').replace(0, 1)
+        relative_volume = df['volume_crypto'] / volume_ma
+
+        # Convert them into percentile ranks for environment-based weighting
+        vol_rank = vol.rank(pct=True).fillna(0.5)
+        trend_rank = trend_strength.rank(pct=True).fillna(0.5)
+        volume_rank = relative_volume.rank(pct=True).fillna(0.5)
+
+        # -------------------------------------------------------------------------
+        # 5) Dynamic weighting function for each bar
+        # -------------------------------------------------------------------------
+        def compute_weights(i):
+            # If not enough history for the medium window, just do equal weighting
+            if i < medium_window:
+                w = {k: 1.0 for k in strategy_metrics.keys()}
+                n = len(w)
+                return {k: v / n for k, v in w.items()}
+
+            # Current environment ranks
+            v_rank = vol_rank.iloc[i]     # Volatility percentile
+            t_rank = trend_rank.iloc[i]   # Trend-strength percentile
+            volm_rank = volume_rank.iloc[i]  # Volume percentile
+
+            scores = {}
+            for strat_name, m in strategy_metrics.items():
+                # Short-term performance
+                sh_short = m['sharpe_short'].iloc[i]
+                so_short = m['sortino_short'].iloc[i]
+                wr_short = m['winrate_short'].iloc[i]
+
+                # Medium-term performance
+                sh_med = m['sharpe_med'].iloc[i]
+                so_med = m['sortino_med'].iloc[i]
+                wr_med = m['winrate_med'].iloc[i]
+
+                # Weighted sum: more emphasis on short term, but keep medium for stability
                 perf_score = (
-                    metrics[strategy]['sharpe'].iloc[i] * 0.4 +
-                    metrics[strategy]['sortino'].iloc[i] * 0.4 +
-                    metrics[strategy]['win_rate'].iloc[i] * 0.2
+                    0.4 * (sh_short + so_short + wr_short) +
+                    0.6 * (sh_med + so_med + wr_med)
                 )
-                
-                # Adjust score based on market conditions
-                if vol_pct > 0.8:  # High volatility
-                    if strategy in ['rsi', 'vwap']:
-                        perf_score *= 1.3
-                elif vol_pct < 0.2:  # Low volatility
-                    if strategy in ['ema', 'macd']:
-                        perf_score *= 1.2
-                
-                if trend_pct > 0.7:  # Strong trend
-                    if strategy in ['macd', 'ema']:
-                        perf_score *= 1.25
-                
-                if vol_pct_rank > 0.75:  # High volume
-                    if strategy in ['volume_rsi', 'vwap']:
-                        perf_score *= 1.2
-                
-                weights[strategy] = max(0, perf_score)
-                total_score += weights[strategy]
-            
-            if total_score > 0:
-                weights = {k: v/total_score for k, v in weights.items()}
+
+                # Subtle environment adjustments
+                if v_rank > 0.75 and strat_name in ['rsi', 'vwap']:
+                    perf_score *= 1.10
+                elif v_rank < 0.25 and strat_name in ['ema', 'macd']:
+                    perf_score *= 1.08
+
+                if t_rank > 0.7 and strat_name in ['ema', 'macd']:
+                    perf_score *= 1.10
+
+                if volm_rank > 0.75 and strat_name in ['volume_rsi', 'vwap']:
+                    perf_score *= 1.10
+
+                # No negative weights
+                if perf_score < 0:
+                    perf_score = 0
+                scores[strat_name] = perf_score
+
+            # Normalize so sum = 1
+            total_score = sum(scores.values())
+            if total_score == 0:
+                w = {k: 1.0 / len(scores) for k in scores.keys()}
             else:
-                weights = {k: 1/len(weights) for k in weights}
-            
-            return weights
-        
-        # Generate signals (kept the same for consistency)
+                w = {k: scores[k] / total_score for k in scores.keys()}
+
+            return w
+
+        # -------------------------------------------------------------------------
+        # 6) Combine signals with dynamic weights
+        # -------------------------------------------------------------------------
+        combined_signal = pd.Series(index=df.index, data=0.0)
         for i in range(len(df)):
-            weights = get_strategy_weights(
-                i, strategy_metrics,
-                vol_rank.iloc[i],
-                trend_rank.iloc[i],
-                trend_direction.iloc[i],
-                volume_rank.iloc[i]
-            )
-            
-            combined_signal = 0
-            for strategy, weight in weights.items():
-                combined_signal += strategy_signals[strategy].iloc[i] * weight
-            
-            if combined_signal > 0.3:
-                signals.iloc[i] = 1
-            elif combined_signal < -0.3:
-                signals.iloc[i] = -1
+            w = compute_weights(i)
+            s = 0.0
+            for strat_name, weight in w.items():
+                s += strategy_signals[strat_name].iloc[i] * weight
+            # Threshold to finalize signal
+            if s > 0.3:
+                combined_signal.iloc[i] = 1
+            elif s < -0.3:
+                combined_signal.iloc[i] = -1
             else:
-                signals.iloc[i] = 0
-        
-        # Apply risk management (kept exactly the same)
-        vol_percentile = returns_vol.rank(pct=True)
-        high_vol_mask = vol_percentile > 0.85
-        signals[high_vol_mask] = signals[high_vol_mask] * 0.5
-        
-        trend_mask = (trend_direction * signals) < 0
-        signals[trend_mask] = 0
-        
-        low_vol_mask = relative_volume < relative_volume.quantile(0.2)
-        signals[low_vol_mask] = 0
-        
-        extreme_vol_mask = returns_vol > returns_vol.quantile(0.95)
-        signals[extreme_vol_mask] = 0
-        
-        return signals
+                combined_signal.iloc[i] = 0
+
+        # -------------------------------------------------------------------------
+        # 7) Risk management (gradual)
+        #    - If volatility is extremely high (top 10%), reduce position 50%
+        #    - If volume is extremely low (lowest 10%), reduce position 50%
+        #    - If combined signal contradicts long-term trend, zero it out
+        # -------------------------------------------------------------------------
+        high_vol_threshold = vol.quantile(0.90)
+        low_volm_threshold = volume_rank.quantile(0.10)
+
+        for i in range(len(df)):
+            sig = combined_signal.iloc[i]
+            # (a) Trend mismatch => zero out
+            if trend_direction.iloc[i] != 0 and np.sign(trend_direction.iloc[i]) != np.sign(sig):
+                combined_signal.iloc[i] = 0
+                continue
+
+            # (b) High volatility => scale down 50%
+            if vol.iloc[i] > high_vol_threshold and sig != 0:
+                combined_signal.iloc[i] = sig * 0.5
+
+            # (c) Extremely low volume => scale down 50%
+            if volume_rank.iloc[i] < low_volm_threshold and combined_signal.iloc[i] != 0:
+                combined_signal.iloc[i] = combined_signal.iloc[i] * 0.5
+
+        return combined_signal
     @classmethod
     def get_all_strategies(cls):
         return {

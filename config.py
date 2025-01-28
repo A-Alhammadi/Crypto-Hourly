@@ -1,3 +1,5 @@
+#config.py
+
 # Database configuration
 DB_CONFIG = {
     "host": "localhost",
@@ -10,13 +12,13 @@ DB_CONFIG = {
 # Backtesting configuration
 BACKTEST_CONFIG = {
     # Date range
-    "start_date": "2020-01-01",
+    "start_date": "2024-11-01",
     "end_date": "2024-12-31",
     
     # Trading pairs to test
     "symbols": ["BTC/USD", "ETH/USD", "XRP/USD", "AAVE/USD",
                  "ADA/USD", "ALGO/USD", "AVAX/USD", "BCH/USD",
-                 "HBAR/USD", "LINK/USD", "LTC/USD", "UNI/USD","XLR/USD"],  # Add all currencies you want to test
+                 "HBAR/USD", "LINK/USD", "LTC/USD", "UNI/USD","XLM/USD"],  # Add all currencies you want to test
     
     # Initial capital for each currency
     "initial_capital": 10000,
